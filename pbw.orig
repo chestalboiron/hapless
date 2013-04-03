@@ -1,0 +1,948 @@
+/*  File: pbwt.c
+ *  Author: Richard Durbin (rd@sanger.ac.uk)
+ *  Copyright (C) Genome Research Limited, 2013
+ *-------------------------------------------------------------------
+ * This file is part of the pbwt package.
+ * pbwt is free software; you can redistribute it and/or modify it under
+ * the terms of the GNU General Public License as published by the Free Software
+ * Foundation; either version 2 of the License, or (at your option) any later
+ * version.
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+ * details.
+ * You should have received a copy of the GNU General Public License along with
+ * this program. If not, see <http://www.gnu.org/licenses/>.
+ *-------------------------------------------------------------------
+ * Description: genotype suffix-array/BWT based analysis code
+ * Exported functions:
+ * HISTORY:
+ * Last edited: Mar 23 02:05 2013 (rd)
+ * Created: Sun Jan  6 12:47:35 2013 (rd)
+ *-------------------------------------------------------------------
+ */
+
+#include "utils.h"
+
+typedef unsigned char uchar ;
+
+typedef struct SiteStruct {
+  int x ;
+  int f ;  		/* number of 1s, < M */
+} Site ;
+
+typedef struct PBWTstruct {
+  int N ;
+  int M ;
+  Array sites ;			/* array of Site */
+  int *a ;
+  int *d ;
+  uchar *y ;
+  Array yz ;			/* compressed BWT array of uchar */
+} PBWT ;
+
+static BOOL isCheck = FALSE ;
+static BOOL isStats = FALSE ;
+static int nCheckPoint = FALSE ;
+
+/***************** rusage for timing information ******************/
+
+#include <sys/resource.h>
+#define RUSAGE_SELF 0
+
+#ifdef RUSAGE_STRUCTURE_DEFINITIONS
+
+struct rusage {
+  struct timeval ru_utime; /* user time used */
+  struct timeval ru_stime; /* system time used */
+  long ru_maxrss;          /* integral max resident set size */
+  long ru_ixrss;           /* integral shared text memory size */
+  long ru_idrss;           /* integral unshared data size */
+  long ru_isrss;           /* integral unshared stack size */
+  long ru_minflt;          /* page reclaims */
+  long ru_majflt;          /* page faults */
+  long ru_nswap;           /* swaps */
+  long ru_inblock;         /* block input operations */
+  long ru_oublock;         /* block output operations */
+  long ru_msgsnd;          /* messages sent */
+  long ru_msgrcv;          /* messages received */
+  long ru_nsignals;        /* signals received */
+  long ru_nvcsw;           /* voluntary context switches */
+  long ru_nivcsw;          /* involuntary context switches */
+};
+
+struct timeval {
+  time_t       tv_sec;   /* seconds since Jan. 1, 1970 */
+  suseconds_t  tv_usec;  /* and microseconds */
+} ;
+
+#endif /* RUSAGE STRUCTURE_DEFINITIONS */
+
+void timeUpdate (void)
+{
+  static BOOL isFirst = TRUE ;
+  static struct rusage rOld ;
+  struct rusage rNew ;
+  int secs, usecs ;
+
+  getrusage (RUSAGE_SELF, &rNew) ;
+  if (!isFirst)
+    { secs = rNew.ru_utime.tv_sec - rOld.ru_utime.tv_sec ;
+      usecs =  rNew.ru_utime.tv_usec - rOld.ru_utime.tv_usec ;
+      if (usecs < 0) { usecs += 1000000 ; secs -= 1 ; }
+      fprintf (stderr, "user\t%d.%06d", secs, usecs) ;
+      secs = rNew.ru_stime.tv_sec - rOld.ru_stime.tv_sec ;
+      usecs =  rNew.ru_stime.tv_usec - rOld.ru_stime.tv_usec ;
+      if (usecs < 0) { usecs += 1000000 ; secs -= 1 ; }
+      fprintf (stderr, "\tsystem\t%d.%06d", secs, usecs) ;
+      fprintf (stderr, "\tmax_RSS\t%ld", rNew.ru_maxrss - rOld.ru_maxrss) ;
+      fputc ('\n', stderr) ;
+    }
+  else
+    isFirst = FALSE ;
+
+  rOld = rNew ;
+}
+
+/****************** Y compression and decompression *************************/
+/****************** low level - does not know about PBWT structures *********/
+
+/* yPack3 is a three level run length encoding: n times value
+   yp & 0x80 = value
+   yp & 0x40 == 0 implies n = yp & 0x3f
+   yp & 0x40 == 1 implies
+     yp & 0x20 == 0 implies n = (yp & 0x1f) << 6
+     yp & 0x20 == 1 implies n = (yp & 0x1f) << 11
+   This allows coding runs of length up to 64 * 32 * 32 = 64k in 3 bytes.
+   Potential factor of ~1000 over a bit array.
+   Build a lookup to avoid conditional operation in uncompression.
+*/
+
+#define Y_SENTINEL 2
+static int yp3decode[128] ;
+#define ENCODE_MAX1 64		     /* ~64 */
+#define ENCODE_MAX2 ((95-63) << 6)   /* ~1k - is this 32 or 31?*/
+#define ENCODE_MAX3 ((127-96) << 11) /* ~64k - ditto */
+
+void yPack3init (void)
+{
+  int n ;
+  for (n = 0 ; n < 64 ; ++n) yp3decode[n] = n ;
+  for (n = 64 ; n < 96 ; ++n) yp3decode[n] = (n-64) << 6 ;
+  for (n = 96 ; n < 128 ; ++n) yp3decode[n] = (n-96) << 11 ;
+}
+
+inline int yPack3Add (uchar yy, uchar *yzp, int n)
+{ 
+  uchar *yzp0 = yzp ;
+
+  yy <<= 7 ;			/* first move the actual symbol to the top bit */
+
+  while (n >= ENCODE_MAX3) { *yzp++ = yy | 0x7f ; n -= ENCODE_MAX3 ; }
+  if (n >= ENCODE_MAX2) { *yzp++ = yy | 0x60 | (n >> 11) ; n &= 0x7ff ; }
+  if (n >= ENCODE_MAX1) { *yzp++ = yy | 0x40 | (n >> 6) ; n &= 0x3f ; }
+  if (n) { *yzp++ = yy | n ; }
+  return yzp - yzp0 ;
+}
+
+int yPack3 (uchar *yp, int M, uchar *yzp) /* pack M chars from y into yz - return number of chars added */
+{ 
+  int m = 0, m0 ;
+  uchar *yzp0 = yzp ;
+  uchar ym ;
+  
+  while (m < M)			/* NB this relies on the M'th character not being 0 or 1 */
+    { ym = *yp++ ; m0 = m++ ;
+      while (*yp == ym) { ++m ; ++yp ; }
+      yzp += yPack3Add (ym, yzp, m-m0) ;
+    }
+  return yzp - yzp0 ;
+}
+
+int yUnpack3 (uchar *yzp, int M, uchar *yp, int *n1) /* unpack yz into M chars in y and move along - return number of chars unpacked - n1 is number of 1s */
+{
+  int m = 0 ;
+  uchar *yzp0 = yzp ;
+  uchar yz ;
+  int n ;
+
+  if (n1) *n1 = 0 ;
+  while (m < M)
+    { yz = *yzp++ ;
+      n = yp3decode[yz & 0x7f] ;
+      m += n ;
+      yz = yz >> 7 ;
+      if (yz && n1) *n1 += n ;
+      if (n > 63)
+	{ memset (yp, yz, n) ;
+	  yp += n ;
+	}
+      else
+	while (n--) *yp++ = yz ;
+    }
+
+  return yzp - yzp0 ;
+}
+
+ uchar *yUnpack3interval (uchar *yy, int min, int max)
+ { 
+   /* idea here is that we can just unpack part of y */
+   /* actually, I can update a and d and u in chunks... */
+ }
+
+/************ key pbwt extension algorithm ************/
+
+void initialiseA (int *a, int M) { int i ; for (i = 0 ; i < M ; ++i) *a++ = i ; }
+
+void updateA (uchar *y, int *a, int M)		/* algorithm 1 in the manuscript */
+{
+  static int *b = 0 ;
+  int u = 0 ;			/* calculate v = i-u */
+  int i ;
+
+  if (!b)			/* initialise */
+    b = myalloc (M * sizeof(int)) ;
+    
+  for (i = 0 ; i < M ; ++i)
+    if (*y++ == 0)
+      a[u++] = a[i] ;
+    else			/* y[i] == 1, since bi-allelic */
+      b[i-u] = a[i] ;
+
+  memcpy (a+u, b, (M-u)*sizeof(int)) ;
+}
+
+/************** core pbwt options *********************/
+
+PBWT *pbwtCreate (int M)
+{
+  PBWT *p = (PBWT*) mycalloc (1, sizeof (PBWT)) ; /* cleared so elements default to 0 */
+
+  p->M = M ;
+  p->a = (int*) myalloc (M*sizeof(int)) ;
+  p->d = (int*) myalloc ((M+1)*sizeof(int)) ;
+  p->y = (uchar*) myalloc (M+1) ;
+  p->y[M] = Y_SENTINEL ;
+
+  return p ;
+}
+
+void pbwtDestroy (PBWT *p)
+{
+  if (p->a) free (p->a) ;
+  if (p->d) free (p->d) ;
+  if (p->y) free (p->y) ;
+  if (p->sites) arrayDestroy (p->sites) ;
+  if (p->yz) arrayDestroy (p->yz) ;
+  free (p) ;
+}
+
+void pbwtWrite (PBWT *p, FILE *fp)
+{
+  int n ;
+
+  if (!p || !p->yz) die ("pbwtWrite called without a valid pbwt") ;
+
+  n = arrayMax(p->yz) ;
+  if (fwrite ("PBWT", 1, 4, fp) != 4)
+    die ("error writing PBWT in pbwtWrite") ;
+  if (fwrite (&p->M, sizeof(int), 1, fp) != 1)
+    die ("error writing M in pbwtWrite") ;
+  if (fwrite (&p->N, sizeof(int), 1, fp) != 1)
+    die ("error writing N in pbwtWrite") ;
+  if (fwrite (&n, sizeof(int), 1, fp) != 1)
+    die ("error writing n in pbwtWrite") ;
+  if (fwrite (arrp(p->yz, 0, uchar), sizeof(uchar), arrayMax(p->yz), fp) != arrayMax(p->yz))
+    die ("error writing data in pbwtWrite") ;
+
+  fprintf (stderr, "written %d chars pbwt: M, N are %d, %d\n", arrayMax(p->yz), p->M, p->N) ;
+}
+
+void pbwtWriteSites (PBWT *p, FILE *fp)
+{
+  int i ;
+
+  if (!p || !p->sites) die ("pbwtWriteSites called without a valid pbwt") ;
+
+  for (i = 0 ; i < p->N ; ++i)
+    fprintf (fp, "%d\n", arrp(p->sites, i, Site)->x) ;
+  if (ferror (fp)) die ("error writing sites file") ;
+
+  fprintf (stderr, "written %d sites from %d to %d\n", p->N, 
+	   arrp(p->sites, 0, Site)->x, arrp(p->sites, p->N-1, Site)->x) ;
+}
+
+void pbwtCheckPoint (PBWT *p)
+{
+  static BOOL isA = TRUE ;
+  char fileName[20] ;
+  FILE *fp ;
+
+  sprintf (fileName, "check_%c.pbwt", isA ? 'A' : 'B') ;
+  if (!(fp = fopen (fileName, "w"))) die ("failed to open checkpoint file %s", fileName) ;
+  pbwtWrite (p, fp) ;
+  fclose (fp) ;
+
+  sprintf (fileName, "check_%c.sites", isA ? 'A' : 'B') ;
+  if (!(fp = fopen (fileName, "w"))) die ("failed to open checkpoint file %s", fileName) ;
+  pbwtWriteSites (p, fp) ;
+  fclose (fp) ;
+
+  isA = !isA ;
+}
+
+PBWT *pbwtRead (FILE *fp) 
+{
+  int m, n ;
+  PBWT *p ;
+  static char tag[5] = "test" ;
+
+#ifdef TRANSITION		/* only used when moving from old to new file format */
+  m = 101000 ;
+  n = 370264 ;
+#else
+  if (fread (tag, 1, 4, fp) != 4 || (strcmp (tag, "PBWT") && strcmp (tag, "GBWT"))) /* early versions wrote GBWT */
+    die ("failed to recognise file type in pbwtRead - was it written by pbwt?") ;
+  if (fread (&m, sizeof(int), 1, fp) != 1)
+    die ("error reading n in pbwtRead") ;
+  if (fread (&n, sizeof(int), 1, fp) != 1)
+    die ("error reading n in pbwtRead") ;
+#endif
+  p = pbwtCreate (m) ;
+  p->N = n ;
+  if (fread (&n, sizeof(int), 1, fp) != 1)
+    die ("error reading pbwt file") ;
+  p->yz = arrayCreate (n, uchar) ;
+  array(p->yz, n-1, uchar) = 0 ; /* sets arrayMax */
+  if (fread (arrp(p->yz, 0, uchar), sizeof(uchar), n, fp) != n)
+    die ("error reading data in pbwt file") ;
+
+  fprintf (stderr, "read pbwt file: M, N are %d, %d\n", p->M, p->N) ;
+  return p ;
+}
+
+void pbwtReadSites (PBWT *p, FILE *fp)
+{
+  int n = 0 ;
+  if (!p) die ("pbwtReadSites called without a valid pbwt") ;
+
+  p->sites = arrayReCreate (p->sites, p->N, Site) ;
+  while (!feof(fp))
+    fscanf (fp, "%d\n", &(arrayp(p->sites, n++, Site)->x)) ;
+  if (ferror (fp)) die ("error reading sites file") ;
+
+  if (n != p->N)
+    { fprintf (stderr, "sites file contains %d sites not %d as in pbwt - reject these sites\n",
+	       n, p->N) ;
+      arrayDestroy (p->sites) ; p->sites = 0 ;
+    }
+  else
+    fprintf (stderr, "read %d sites from file\n", n) ;
+}
+
+/*************** subsites and subsamples **************/
+
+PBWT *pbwtSubSample (PBWT *pOld, int start, int m)
+{
+  PBWT *pNew = pbwtCreate (m) ;
+  int i, j, nOld = 0 , nNew, k ;
+  uchar *x, *yz ;
+
+  if (!pOld || !pOld->yz) die ("subsample called without an valid existing pbwt") ;
+  pNew->N = pOld->N ;
+
+  x = (uchar*) myalloc (pNew->M) ;
+  yz = (uchar*) myalloc (pNew->M) ;
+
+  initialiseA (pOld->a, pOld->M) ;
+  initialiseA (pNew->a, pNew->M) ;
+  pNew->yz = arrayCreate (pNew->N*8, uchar) ;
+  for (i = 0 ; i < pOld->N ; ++i)
+    { nOld += yUnpack3 (arrp(pOld->yz,nOld,uchar), pOld->M, pOld->y, 0) ;
+      for (j = 0 ; j < pOld->M ; ++j)
+	if ((k = pOld->a[j] - start) >= 0 && k < m)
+	  x[k] = pOld->y[j] ;
+      for (j = 0 ; j < pNew->M ; ++j)
+	pNew->y[j] = x[pNew->a[j]] ;
+      nNew = yPack3 (pNew->y, pNew->M, yz) ;
+      for (j = 0 ; j < nNew ; ++j) array(pNew->yz,arrayMax(pNew->yz),uchar) = yz[j] ;
+      updateA (pOld->y, pOld->a, pOld->M) ;
+      updateA (pNew->y, pNew->a, pNew->M) ;
+    }
+
+  pNew->sites = pOld->sites ; pOld->sites = 0 ;
+  pbwtDestroy (pOld) ;
+  free(x) ; free(yz) ;
+  return pNew ;
+}
+
+PBWT *pbwtSubSites (PBWT *pOld, double fmin, double frac)
+{
+  int M = pOld->M ;
+  PBWT *pNew = pbwtCreate (M) ;
+  int i, j, nOld = 0, nNew, k, n1, thresh = M*fmin  ;
+  double bit = 0.0 ;
+  uchar *x, *yz ;
+
+  if (!pOld || !pOld->sites) die ("subsites without an existing pbwt") ;
+
+  x = (uchar*) myalloc (M) ;
+  yz = (uchar*) myalloc (M) ;
+  pNew->sites = arrayCreate (4096, Site) ;
+
+  initialiseA (pOld->a, M) ;
+  initialiseA (pNew->a, M) ;
+  pNew->yz = arrayCreate (pNew->N*8, uchar) ;
+  for (i = 0 ; i < pOld->N ; ++i)
+    { nOld += yUnpack3 (arrp(pOld->yz,nOld,uchar), M, pOld->y, &n1) ;
+      if ((n1 > thresh) && ((bit += frac) > 1.0))
+	{ for (j = 0 ; j < M ; ++j)
+	    x[pOld->a[j]] = pOld->y[j] ;
+	  for (j = 0 ; j < M ; ++j)
+	    pNew->y[j] = x[pNew->a[j]] ;
+	  nNew = yPack3 (pNew->y, M, yz) ;
+	  for (j = 0 ; j < nNew ; ++j) array(pNew->yz,arrayMax(pNew->yz),uchar) = yz[j] ;
+	  updateA (pNew->y, pNew->a, M) ;
+	  array(pNew->sites, pNew->N++, Site) = arr(pOld->sites, i, Site)  ;
+	  bit -= 1.0 ;
+	}  
+      updateA (pOld->y, pOld->a, M) ;
+    }
+
+  fprintf (stderr, "subsites with fmin %f, frac %f leaves %d sites\n", fmin, frac, pNew->N) ;
+
+  pbwtDestroy (pOld) ;
+  free(x) ; free(yz) ;
+  return pNew ;
+}
+
+/****************** MaCS file parsing *****************/
+
+void parseMacsHeader (FILE *fp, int *M, double *L)	/* parse MACS file header */
+{
+  if (strcmp (fgetword (fp), "COMMAND:")) die ("MaCS COMMAND line not found") ;
+  fgetword (fp) ; 		/* the command */
+  *M = atoi(fgetword(fp)) ; if (!*M) die ("failed to get M") ;
+  *L = atof(fgetword(fp)) ; if (!*L) die ("failed to get L") ;
+  while (fgetc(fp) != '\n') ;	/* ignore rest of line */
+  
+  if (strcmp (fgetword (fp), "SEED:")) die ("SEED line not found") ;
+  while (fgetc(fp) != '\n') ;	/* ignore rest of line */
+}
+
+BOOL parseMacsSite (FILE *fp, Site *s, int M, double L, uchar *yp) /* parse MACS site line */
+{
+  static uchar conv[256] ;
+  static BOOL isFirst = TRUE ;
+  int number ;
+
+  if (isFirst) { conv['0'] = 0 ; conv['1'] = 1 ; isFirst = FALSE ; }
+  if (feof (fp)) return FALSE ;
+
+  if (strcmp (fgetword (fp), "SITE:")) 
+    { if (feof (fp)) return FALSE ;
+      die ("MaCS SITE line not found") ;
+    }
+  number = atoi(fgetword(fp)) ;	/* this is the site number */
+  s->x = (int) (L * atof(fgetword(fp))) ;
+  atof(fgetword(fp)) ;		/* ignore the time */
+  while (M--)
+    *yp++ = conv[getc(fp)] ;
+  if (feof (fp)) return FALSE ;
+  if (getc(fp) != '\n') die ("end of line error for MaCS SITE %d", number) ;
+
+  return TRUE ;
+}
+
+PBWT *readMacs (FILE *fp)
+{
+  PBWT *p ;
+  int M ;
+  double L ;
+  int i,j, nxPack, nyPack, nUnpack, n1 ;
+  int nxTot = 0, nyTot = 0 ;
+  uchar *x, *yz, *y2 ;		/* original, sorted, compressed, uncompressed */
+  int *a ;
+
+  parseMacsHeader (fp, &M, &L) ;
+  p = pbwtCreate (M) ;
+  x = (uchar*) myalloc (M+1) ; x[M] = Y_SENTINEL ;	/* sentinel required for packing */
+  yz = (uchar*) myalloc (M) ;
+  y2 = (uchar*) myalloc (M) ;
+
+  p->M = M ;
+  p->sites = arrayCreate(4096, Site) ;
+  p->yz = arrayCreate(4096*32, uchar) ;
+  p->N = 0 ;
+  initialiseA (p->a, M) ;
+  while (parseMacsSite (fp, arrayp(p->sites,p->N,Site), M, L, x))
+    { for (j = 0 ; j < M ; ++j) p->y[j] = x[p->a[j]] ; /* next character in sort order: BWT */
+      nyPack = yPack3 (p->y, M, yz) ;
+      for (j = 0 ; j < nyPack ; ++j) array(p->yz,arrayMax(p->yz),uchar) = yz[j] ;
+      updateA (p->y, p->a, M) ;
+      if (isCheck)
+	{ int nx1 ;
+	  nUnpack = yUnpack3 (yz, M, y2, &n1) ;
+	  for (j = 0 ; j < M ; j++)
+	    if (y2[j] != p->y[j])
+	      die ("Mismatch y2:%d != y:%d at %d line %d", y2[j], p->y[j], j, i) ;
+	  if (nUnpack != nyPack)
+	    die ("Unpack %d is not equal to pack %d line %d", nUnpack, nyPack, i) ;
+	  nx1 = 0 ; for (j = 0 ; j < M ; ++j) if (x[j]) ++nx1 ;
+	  if (nx1 != n1)
+	    die ("Mismatch nx1:%d != n1:%d line %d", nx1, n1) ;
+      	}
+      if (isStats)
+	{ if (!isCheck) nUnpack = yUnpack3 (yz, M, y2, &n1) ;
+	  nxPack = yPack3 (x, M, yz) ;
+	  printf ("Site\t%d\t%d\t%d\t%d\t%d\n", 
+		  p->N, arrp(p->sites,p->N,Site)->x, n1, nxPack, nyPack) ;
+	  nxTot += nxPack ;
+	  nyTot += nyPack ;
+      	}
+      p->N++ ;
+      if (nCheckPoint && !(p->N % nCheckPoint))
+	pbwtCheckPoint (p) ;
+    }
+
+  fprintf (stderr, "read MaCS file: M, N are\t%d\t%d\n", M, p->N) ;
+  if (isStats)
+    fprintf (stderr, "                xtot, ytot are\t%d\t%d\n", nxTot, nyTot) ;
+
+  free(x) ; free (yz) ; free (y2) ;
+
+  return p ;
+}
+
+/*************** write haplotypes ******************/
+
+static uchar **xHap = 0 ;	/* haplotype arrays; costly - mostly for checking */
+static int Mhap, Nhap ;		/* size when Haps last built */
+/* ugly that these are globals, but convenient for checking */
+
+void makeHaplotypes (PBWT *p)
+{
+  int M = p->M ;
+  int i, j, n = 0 ;
+  int *a ;
+
+  if (xHap && Mhap == p->M && Nhap == p->N) /* assume this is the same PBWT, so done */
+    return ;
+
+  if (xHap && (Mhap < p->M || Nhap < p->N))
+    { for (i = 0 ; i < Mhap ; ++i) free (xHap[i]) ;
+      free (xHap) ;
+      xHap = 0 ;
+    }
+
+  if (!xHap)
+    { xHap = (uchar**) myalloc (M * sizeof(uchar*)) ;
+      for (i = 0 ; i < M ; ++i) xHap[i] = (uchar*) myalloc (p->N) ;
+      Mhap = p->M ; Nhap = p->N ;
+    }
+
+  initialiseA (p->a, M) ;
+  for (i = 0 ; i < p->N ; ++i)
+    { n += yUnpack3 (arrp(p->yz,n,uchar), M, p->y, 0) ;
+      for (j = 0 ; j < M ; ++j) xHap[p->a[j]][i] = p->y[j] ;
+      updateA (p->y, p->a, M) ;
+    }
+}
+
+void writeHaplotypes (FILE *fp, PBWT *p)
+{
+  int i, j ;
+
+  makeHaplotypes (p) ;
+  for (i = 0 ; i < p->N ; ++i)
+    { for (j = 0 ; j < p->M ; ++j) putc (xHap[j][i]?'1':'0', fp) ;
+      putc ('\n', fp) ;
+    }
+
+  fprintf (stderr, "written haplotype file: %d rows of %d\n", p->N, p->M) ;
+}
+
+/************ finding long (or maximal) matches within the set ************/
+
+void initialiseD (int* d, int M) { memset (d, 0, M*sizeof(int)) ; }
+
+void reportMatch (int ai, int bi, int start, int end)
+{
+  if (start == end) return ;
+  printf ("MATCH\t%d\t%d\t%d\t%d\t%d\n", ai, bi, start, end, end-start) ;
+  if (isCheck)			/* check match is a real match and maximal */
+    { int i ;
+      if (start && (xHap[ai][start-1] == xHap[bi][start-1]))
+	printf ("match not maximal - can extend backwards\n") ;
+      if (end < Nhap && (xHap[ai][end] == xHap[bi][end]))
+	printf ("match not maximal - can extend forwards\n") ;
+      for (i = start ; i < end ; ++i)
+	if (xHap[ai][i] != xHap[bi][i])
+	  printf ("match not a match at %d\n", i) ;
+      if (ai == bi)
+	die ("ai %d == bi", ai) ;
+    }
+}
+
+void updateA_D (uchar *y, int *a, int *d, int k, int M) /* algorithm 2 in the manuscript */
+{
+  static int *b = 0 ;
+  static int *e ;
+  int u = 0, v = 0 ;
+  int i ;
+  int p = k+1 ; int q = k+1 ;
+
+  if (!b)			/* initialise */
+    { b = myalloc (M * sizeof(int)) ;
+      e = myalloc (M * sizeof(int)) ;
+    }
+    
+  for (i = 0 ; i < M ; ++i)
+    { if (d[i] > p) p = d[i] ;
+      if (d[i] > q) q = d[i] ;
+      if (*y++ == 0)		/* NB x[a[i]] = y[i] in manuscript */
+	{ a[u] = a[i] ;
+	  d[u] = p ;
+	  ++u ; p = 0 ;
+	}
+      else			/* y[i] == 1, since bi-allelic */
+	{ b[v] = a[i] ;
+	  e[v] = q ;
+	  ++v ; q = 0 ;
+	}
+    }
+
+  memcpy (a+u, b, v*sizeof(int)) ;
+  memcpy (d+u, e, v*sizeof(int)) ; d[0] = k+2 ; d[M] = k+2 ; /* sentinels */
+
+#ifdef DEBUG_UPDATE
+  y -= M ;
+  printf ("k %d\ny", k) ; for (i = 0 ; i < M ; ++i) printf (" %4d", y[i]) ;
+  printf ("\na") ; for (i = 0 ; i < M ; ++i) printf (" %4d", a[i]) ;
+  printf ("\nd") ; for (i = 0 ; i <= M ; ++i) printf (" %4d", d[i]) ;
+  printf ("\n") ;
+#endif
+}
+
+void reportLongMatches1 (uchar *y, int *ak, int *d, int T, int k, int M) /* algorithm 3 */
+{
+  static int *a, *b = 0 ;
+  int i, ia, ib, na = 0, nb = 0 ;
+
+  if (!b)			/* initialise */
+    { a = myalloc (M * sizeof(int)) ;
+      b = myalloc (M * sizeof(int)) ;
+    }
+  for (i = 0 ; i < M ; ++i)
+    { if (d[i] > T)
+	{ for (ia = 0 ; ia < na ; ++ia)
+	    for (ib = 0 ; ib < nb ; ++ib) 
+	      reportMatch (a[ia], a[ib], 0, k) ; /* 0 is wrong! - not easy to get start */
+	  na = 0 ; nb = 0 ;			 /* NB because of this matches won't check */
+	}
+      if (*y++ == 0)
+	a[na++] = *ak++ ;
+      else
+	b[nb++] = *ak++ ;
+    }
+}
+
+void reportLongMatches2 (uchar *y, int *a, int *d, int T, int k, int M, BOOL isInternal) 
+/* alternative giving start - it turns out in tests that this is faster, so use this */
+{
+  int i, i0 = 0, ia, ib, na = 0, nb = 0, dmin ;
+
+  for (i = 0 ; i < M ; ++i)
+    { if (d[i] > T)
+	{ if (na && nb)		/* then there is something to report */
+	    for (ia = i0 ; ia < i ; ++ia)
+	      for (ib = ia+1, dmin = 0 ; ib < i ; ++ib)
+		{ if (d[ib] > dmin) dmin = d[ib] ;
+		  if (y[ib] != y[ia])
+		    reportMatch (a[ia], a[ib], dmin, k) ;
+		}
+	  na = 0 ; nb = 0 ; i0 = i ;
+	}
+      if (y[i] == 0)
+	na++ ;
+      else
+	nb++ ;
+    }
+}
+
+void reportMaximalMatches1 (uchar *y, int *a, int *d, int k, int M, BOOL isInternal)
+/* algorithm 4 in paper */
+{
+  int i, j, m, n ;
+
+  for (i = 0 ; i < M ; ++i)
+    { m = i-1 ; n = i+1 ;
+      if (d[i] <= d[i+1])
+	while (d[m+1] <= d[i])
+	  if (y[m--] == y[i] && isInternal) goto nexti ; /* ERROR in paper: != should be == */
+      if (d[i] >= d[i+1])
+	while (d[n] <= d[i+1])
+	  if (y[n++] == y[i] && isInternal) goto nexti ; /* ERROR in paper: != should be == */
+      for (j = m+1 ; j < i ; ++j) reportMatch (a[i], a[j], d[i], k) ;
+      for (j = i+1 ; j < n ; ++j) reportMatch (a[i], a[j], d[i+1], k) ;
+      nexti: ;
+    }
+}
+
+void reportMaximalMatches2 (uchar *y, int *a, int *d, int k, int M, BOOL isInternal)
+/* I think there is a good alternative... */
+{
+  int i, j, last0, last1 ;
+
+  for (i = 0 ; i < M ; ++i)
+    { if (y[i] == 0) last0 = i ; 
+      else last1 = i ;
+    }
+}
+
+void findLongMatches (PBWT *p, int L) /* reporting threshold L - if 0 then maximal */
+{
+  int k, n = 0 ;
+
+  if (!p) die ("option -long called without a PBWT") ;
+
+  if (isCheck) makeHaplotypes(p) ;
+
+  initialiseA (p->a, p->M) ;
+  initialiseD (p->d, p->M) ;
+  for (k = 0 ; k < p->N ; ++k)
+    { n += yUnpack3 (arrp(p->yz,n,uchar), p->M, p->y, 0) ;
+      if (L)
+	reportLongMatches2 (p->y, p->a, p->d, k-L, k, p->M, 1) ;
+      else
+	reportMaximalMatches1 (p->y, p->a, p->d, k, p->M, 1) ;
+      updateA_D (p->y, p->a, p->d, k, p->M) ;
+    }
+  if (L)
+    reportLongMatches2 (p->y, p->a, p->d,p->N - L, p->N, p->M, 0) ;
+  else
+    reportMaximalMatches1 (p->y, p->a, p->d, p->N, p->M, 0) ;
+}
+
+/**************** now matching a new sequence **********************/
+
+void updateA_D_U (uchar *y, int *a, int *d, int M, int k,	/* update a[], d[], y[], u[] */
+		  int *aNew, int *dNew, int *uNew)
+{
+  static int *b = 0, *e ;
+  int i, u = 0 ;		/* calculate v = i-u */
+  int p = k+1 ; int q = k+1 ;
+
+  if (!b)			/* initialise */
+    { b = myalloc (M * sizeof(int)) ;
+      e = myalloc (M * sizeof(int)) ;
+    }
+    
+  for (i = 0 ; i < M ; ++i)
+    { if (d[i] > p) p = d[i] ;
+      if (d[i] > q) q = d[i] ;
+      if (*y++ == 0)		/* NB x[a[i]] = y[i] in manuscript */
+	{ *aNew++ = a[i] ;
+	  *dNew++ = p ;
+	  u++ ; p = 0 ;
+	}
+      else			/* y[i] == 1, since bi-allelic */
+	{ b[i-u] = a[i] ;
+	  e[i-u] = q ;
+	  q = 0 ;
+	}
+      *uNew++ = u ;
+    }
+  memcpy (aNew, b, (M-u)*sizeof(int)) ;
+  memcpy (dNew, e, (M-u)*sizeof(int)) ;
+}
+
+void pbwtTest (PBWT *p, FILE *fp)
+{
+  PBWT *pTest = pbwtRead (fp) ;
+  int i, j, k, n = 0 ;
+  int **a, **d, **u, *c ;
+  uchar **y, **z ;
+  int f,g,e,f1,g1,e1 ;
+
+  if (pTest->N == p->N)
+    { a = (int**) myalloc ((p->N+1)*sizeof(int*)) ;
+      d = (int**) myalloc ((p->N+1)*sizeof(int*)) ;
+      u = (int**) myalloc (p->N*sizeof(int*)) ;
+      y = (uchar**) myalloc (p->N*sizeof(uchar*)) ;
+      c = (int*) myalloc (p->N*sizeof(int)) ;
+      a[0] = (int*) myalloc (p->M*sizeof(int)) ;
+      initialiseA (a[0], p->M) ;
+      d[0] = (int*) mycalloc (p->M,sizeof(int)) ;
+      for (i = 0 ; i < p->N ; ++i)
+	{ a[i+1] = (int*) myalloc (p->M*sizeof(int)) ;
+	  d[i+1] = (int*) myalloc (p->M*sizeof(int)) ;
+	  u[i] = (int*) myalloc (p->M*sizeof(int)) ;
+	  y[i] = (uchar*) myalloc (p->M*sizeof(uchar)) ;
+	  n += yUnpack3 (arrp(p->yz,n,uchar), p->M, y[i], &c[i]) ;
+	  updateA_D_U (y[i], a[i], d[i], p->M, i, a[i+1], d[i+1], u[i]) ;
+	}
+      fprintf (stderr, "built data structures for test\n") ;
+      timeUpdate () ;
+
+      z = (uchar**) myalloc (pTest->M*sizeof(uchar*)) ;
+      for (j = 0 ; j < pTest->M ; ++j) z[j] = (uchar*) myalloc (pTest->N*sizeof(uchar)) ;
+      initialiseA (pTest->a, pTest->M) ;
+      n = 0 ;
+      for (i = 0 ; i < pTest->N ; ++i)
+	{ n += yUnpack3 (arrp(pTest->yz,n,uchar), pTest->M, pTest->y, 0) ;
+	  updateA (pTest->y, pTest->a, pTest->M) ;
+	  for (j = 0 ; j < pTest->M ; ++j) z[pTest->a[j]][i] = pTest->y[j] ;	  
+	}
+      fprintf (stderr, "extracted test sequences\n") ;
+      timeUpdate () ;
+
+#ifdef OUT_OF_TIME
+      for (j = 0 ; j < pTest->M ; ++j) /* now test each test sequence in turn */
+	{ uchar *zz = z[j] ;
+	  e = 0 ; f = 0 ; g = pTest->M ;
+	  for (k = 0 ; k < p->N ; ++k)
+	    { if (z[k] == 0) { f1 = u[k][f] ; g1 = u[k][g] ; }
+	      else { f1 = c[k] + f - u[k][f] ; g1 = c[k] + g - u[k][g] ; }
+	      if (f1 == g1)
+		{ for (i = f ; i < g ; ++i) /* report matches! */
+		    { printf ("match test %d to ref %d [%d,%d)\n", j, a[k][i], e, k) ;
+		      matchTot++ ;
+		    }
+		  e1 = d[k+1][f1] - 1 ; /* now find new e1 */
+		  if (zz[e1] == 0 && f1 > 0)
+		    { f1 = g1 - 1 ; 
+		      while (zz[e1-1] == !!!!!!! ) do e1 = e1 - 1 ; 
+		    }
+		  else
+		}
+	      e = e1 ; f = f1 ; g = g1 ;
+	    }
+	}
+#endif
+    }
+  else
+    fprintf (stderr, "test pbwt has different length %d from main pbwt %d - no test done",
+	     pTest->N, p->N) ;
+  
+  pbwtDestroy (pTest) ;
+}
+
+/*********************************************************/
+
+/* a couple of utilities */
+#define FOPEN(name,mode)  if (!strcmp (argv[1], "-")) fp = stdin ; else if (!(fp = fopen (argv[1],mode))) die ("failed to open macs file %s", name, argv[1])
+#define FCLOSE if (strcmp(argv[1], "-")) fclose(fp)
+
+int main (int argc, char *argv[])
+{
+  FILE *fp ;
+  PBWT *p = 0 ;
+  Array test ;
+
+  yPack3init () ;
+
+  --argc ; ++argv ;
+  if (!argc)			/* print help */
+    { fprintf (stderr, "Usage: pbwt -<command> [options] ...\n") ;
+      fprintf (stderr, "Commands: -check            do various checks\n") ;
+      fprintf (stderr, "          -stats            print stats depending on commands; writes to stdout\n") ;
+      fprintf (stderr, "          -macs <file>      read MaCS output file; '-' for stdin\n") ;
+      fprintf (stderr, "          -haps <file>      write haplotype file; '-' for stdout\n") ;
+      fprintf (stderr, "          -write <file>     write pbwt file; '-' for stdout\n") ;
+      fprintf (stderr, "          -writeSites <file>  write sites file; '-' for stdout\n") ;
+      fprintf (stderr, "          -read <file>      read pbwt file; '-' for stdin\n") ;
+      fprintf (stderr, "          -readSites <file>   read sites file; '-' for stdin\n") ;
+      fprintf (stderr, "          -checkpoint <n>   checkpoint writing every n sites\n") ;
+      fprintf (stderr, "          -subsites <fmin> <frac>  subsample <frac> sites with AF > <fmin>\n") ;
+      fprintf (stderr, "          -subsample <start> <n>  subsample <n> samples from index <start>\n") ;
+      fprintf (stderr, "          -longWithin <L>  find matches within set longer than L\n") ;
+      fprintf (stderr, "          -maximalWithin   find maximal matches within set\n") ;
+      fprintf (stderr, "          -test <file>      match samples in pbwt test file\n") ;
+    }
+
+  timeUpdate() ;
+  while (argc) {
+    if (!(**argv == '-'))
+      die ("not well formed command %s\nType pbwt without arguments for help", *argv) ;
+    else if (!strcmp (argv[0], "-check"))
+      { isCheck = TRUE ;
+	argc -= 1 ; argv += 1 ;
+      }
+    else if (!strcmp (argv[0], "-stats"))
+      { isStats = TRUE ;
+	argc -= 1 ; argv += 1 ;
+      }
+    else if (!strcmp (argv[0], "-macs") && argc > 1)
+      { if (p) pbwtDestroy (p) ;
+	FOPEN("macs","r") ; p = readMacs (fp) ;	FCLOSE ;
+	argc -= 2 ; argv += 2 ;
+      }
+    else if (!strcmp (argv[0], "-haps") && argc > 1)
+      { FOPEN("haps","w") ; writeHaplotypes (fp, p) ; FCLOSE ;
+	argc -= 2 ; argv += 2 ;
+      }
+    else if (!strcmp (argv[0], "-read") && argc > 1)
+      { if (p) pbwtDestroy (p) ;
+	FOPEN("read","r") ; p = pbwtRead (fp) ; FCLOSE ;
+	argc -= 2 ; argv += 2 ;
+      }
+    else if (!strcmp (argv[0], "-readSites") && argc > 1)
+      { FOPEN("readSites","r") ; pbwtReadSites (p, fp) ; FCLOSE ;
+	argc -= 2 ; argv += 2 ;
+      }
+    else if (!strcmp (argv[0], "-write") && argc > 1)
+      { FOPEN("write","w") ; pbwtWrite (p, fp) ; FCLOSE ;
+	argc -= 2 ; argv += 2 ;
+      }
+    else if (!strcmp (argv[0], "-writeSites") && argc > 1)
+      { FOPEN("writeSites","w") ; pbwtWriteSites (p, fp) ; FCLOSE ;
+	argc -= 2 ; argv += 2 ;
+      }
+    else if (!strcmp (argv[0], "-checkpoint") && argc > 1)
+      { nCheckPoint = atoi (argv[1]) ;
+	if (nCheckPoint < 0) die ("checkpoint value %d must not be negative", nCheckPoint) ;
+	argc -= 2 ; argv += 2 ;
+      }
+    else if (!strcmp (argv[0], "-test") && argc > 1)
+      { FOPEN("test","r") ; pbwtTest (p, fp) ; FCLOSE ;
+	argc -= 2 ; argv += 2 ;
+      }
+    else if (!strcmp (argv[0], "-longWithin") && argc > 1)
+      { int L = atoi (argv[1]) ;
+	if (L > 0) 
+	  findLongMatches (p, L) ;
+	else 
+	  fprintf (stderr, "for option -long, L %s must be >0\n", argv[1]) ;
+	argc -= 2 ; argv += 2 ;
+      }
+    else if (!strcmp (argv[0], "-maximalWithin"))
+      { findLongMatches (p, 0) ;
+	argc -= 1 ; argv += 1 ;
+      }
+    else if (!strcmp (argv[0], "-subsample") && argc > 2)
+      { int start = atoi (argv[1]) ;
+	int n = atoi (argv[2]) ;
+	if (start >= 0 && n > 0)
+	  p = pbwtSubSample (p, start, n) ;
+	else
+	  fprintf (stderr, "start %d, n %d arguments for subsample must be >0\n", start, n) ;
+	argc -= 3 ; argv += 3 ;
+      }
+    else if (!strcmp (argv[0], "-subsites") && argc > 2)
+      { double freqmin = atof (argv[1]) ;
+	double fraction = atof (argv[2]) ;
+	if (freqmin >= 0 && freqmin < 1 && fraction > 0 && fraction < 1)
+	  p = pbwtSubSites (p, freqmin, fraction) ;
+	else
+	  fprintf (stderr, "fmin %f, frac %f arguments for subsites must be between 0 and 1\n", 
+		   freqmin, fraction) ;
+	argc -= 3 ; argv += 3 ;
+      }
+    else
+      die ("unrecognised command %s\nType pbwt without arguments for help", *argv) ;
+    timeUpdate() ;
+  }
+}
+
+/*************************************/
